@@ -159,6 +159,51 @@ def _adopt_existing_tab_enabled(camofox_cfg: Dict[str, Any]) -> bool:
     return bool(camofox_cfg.get("adopt_existing_tab"))
 
 
+def _get_default_viewport(camofox_cfg: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, int]]:
+    """Return configured default Camofox viewport, if present and valid."""
+    camofox_cfg = camofox_cfg or _get_camofox_config()
+    viewport = camofox_cfg.get("default_viewport") or camofox_cfg.get("viewport")
+    if not isinstance(viewport, dict):
+        return None
+    try:
+        width = int(viewport.get("width", 0))
+        height = int(viewport.get("height", 0))
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid browser.camofox.default_viewport: %r", viewport)
+        return None
+    if not (100 <= width <= 4000 and 100 <= height <= 4000):
+        logger.warning("Ignoring out-of-range browser.camofox.default_viewport: %r", viewport)
+        return None
+    return {"width": width, "height": height}
+
+
+def _apply_default_viewport(session: Dict[str, Any], camofox_cfg: Optional[Dict[str, Any]] = None) -> None:
+    """Apply configured default viewport to the active tab, best-effort."""
+    tab_id = session.get("tab_id")
+    user_id = session.get("user_id")
+    viewport = _get_default_viewport(camofox_cfg)
+    if not tab_id or not user_id or not viewport:
+        return
+    try:
+        _post(
+            f"/tabs/{tab_id}/viewport",
+            {"userId": user_id, **viewport},
+            timeout=10,
+        )
+        session["viewport_applied"] = viewport
+    except Exception as exc:
+        logger.debug("Could not apply Camofox default viewport to %s: %s", tab_id, exc)
+
+
+def _tradingview_snapshot_enabled(camofox_cfg: Optional[Dict[str, Any]] = None) -> bool:
+    """Return whether browser_vision should prefer TradingView's clean snapshot export."""
+    camofox_cfg = camofox_cfg or _get_camofox_config()
+    env_value = _env_flag("CAMOFOX_TRADINGVIEW_SNAPSHOT")
+    if env_value is not None:
+        return env_value
+    return bool(camofox_cfg.get("tradingview_snapshot", False))
+
+
 # ---------------------------------------------------------------------------
 # Session management
 # ---------------------------------------------------------------------------
@@ -201,6 +246,7 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(tab_id, str) and tab_id:
         session["tab_id"] = tab_id
         logger.debug("Adopted existing Camofox tab %s for %s", tab_id, session.get("user_id"))
+        _apply_default_viewport(session)
 
     return session
 
@@ -266,6 +312,7 @@ def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, A
     resp.raise_for_status()
     data = resp.json()
     session["tab_id"] = data.get("tabId")
+    _apply_default_viewport(session)
     return session
 
 
@@ -305,7 +352,7 @@ def _post(path: str, body: dict, timeout: int = _DEFAULT_TIMEOUT) -> dict:
     return resp.json()
 
 
-def _get(path: str, params: dict = None, timeout: int = _DEFAULT_TIMEOUT) -> dict:
+def _get(path: str, params: Optional[dict] = None, timeout: int = _DEFAULT_TIMEOUT) -> dict:
     """GET from camofox and return parsed response."""
     url = f"{get_camofox_url()}{path}"
     resp = requests.get(url, params=params, timeout=timeout)
@@ -313,7 +360,7 @@ def _get(path: str, params: dict = None, timeout: int = _DEFAULT_TIMEOUT) -> dic
     return resp.json()
 
 
-def _get_raw(path: str, params: dict = None, timeout: int = _DEFAULT_TIMEOUT) -> requests.Response:
+def _get_raw(path: str, params: Optional[dict] = None, timeout: int = _DEFAULT_TIMEOUT) -> requests.Response:
     """GET from camofox and return raw response (for binary data)."""
     url = f"{get_camofox_url()}{path}"
     resp = requests.get(url, params=params, timeout=timeout)
@@ -321,12 +368,79 @@ def _get_raw(path: str, params: dict = None, timeout: int = _DEFAULT_TIMEOUT) ->
     return resp
 
 
-def _delete(path: str, body: dict = None, timeout: int = _DEFAULT_TIMEOUT) -> dict:
+def _delete(path: str, body: Optional[dict] = None, timeout: int = _DEFAULT_TIMEOUT) -> dict:
     """DELETE to camofox and return parsed response."""
     url = f"{get_camofox_url()}{path}"
     resp = requests.delete(url, json=body, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
+
+
+def _current_tab_url(session: Dict[str, Any]) -> str:
+    """Return the current URL for a Camofox tab, best-effort."""
+    try:
+        tabs = _get("/tabs", params={"userId": session["user_id"]}, timeout=5).get("tabs", [])
+        for tab in tabs:
+            if isinstance(tab, dict) and tab.get("tabId") == session.get("tab_id"):
+                return str(tab.get("url") or "")
+    except Exception:
+        pass
+    return ""
+
+
+def _decode_data_url(data_url: str) -> Optional[bytes]:
+    """Decode a data:image/png;base64,... URL into bytes."""
+    if not isinstance(data_url, str) or not data_url.startswith("data:image/png;base64,"):
+        return None
+    try:
+        return base64.b64decode(data_url.split(",", 1)[1])
+    except Exception:
+        return None
+
+
+def _capture_tradingview_clean_snapshot(session: Dict[str, Any]) -> Optional[bytes]:
+    """Use TradingView's Ctrl+Alt+S clean chart snapshot export, if available.
+
+    Camofox exposes tab downloads as data URLs, which lets us consume the
+    TradingView-generated chart PNG directly instead of taking a full browser
+    viewport screenshot.
+    """
+    tab_id = session.get("tab_id")
+    user_id = session.get("user_id")
+    if not tab_id or not user_id:
+        return None
+
+    try:
+        before = _get(f"/tabs/{tab_id}/downloads", params={"userId": user_id}, timeout=5).get("downloads", [])
+        before_ids = {d.get("id") for d in before if isinstance(d, dict)}
+    except Exception:
+        before_ids = set()
+
+    try:
+        _post(f"/tabs/{tab_id}/press", {"userId": user_id, "key": "Control+Alt+S"}, timeout=10)
+    except Exception as exc:
+        logger.debug("TradingView clean snapshot shortcut failed: %s", exc)
+        return None
+
+    import time
+    deadline = time.time() + 10
+    last_candidate: Optional[bytes] = None
+    while time.time() < deadline:
+        try:
+            downloads = _get(f"/tabs/{tab_id}/downloads", params={"userId": user_id}, timeout=5).get("downloads", [])
+        except Exception:
+            downloads = []
+        for item in reversed(downloads if isinstance(downloads, list) else []):
+            if not isinstance(item, dict):
+                continue
+            data = _decode_data_url(str(item.get("url") or ""))
+            if not data:
+                continue
+            if item.get("id") not in before_ids:
+                return data
+            last_candidate = data
+        time.sleep(0.5)
+    return last_candidate
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +462,7 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
                 {"userId": session["user_id"], "url": url},
                 timeout=60,
             )
+            _apply_default_viewport(session)
         result = {
             "success": True,
             "url": data.get("url", url),
@@ -594,11 +709,25 @@ def camofox_vision(question: str, annotate: bool = False,
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
-        # Get screenshot as binary PNG
-        resp = _get_raw(
-            f"/tabs/{session['tab_id']}/screenshot",
-            params={"userId": session["user_id"]},
-        )
+        # Prefer TradingView's own clean chart snapshot export when enabled.
+        screenshot_source = "browser_viewport"
+        image_bytes: Optional[bytes] = None
+        current_url = _current_tab_url(session)
+        if _tradingview_snapshot_enabled() and "tradingview.com" in current_url:
+            image_bytes = _capture_tradingview_clean_snapshot(session)
+            if image_bytes:
+                screenshot_source = "tradingview_ctrl_alt_s"
+
+        if image_bytes is None:
+            # Get screenshot as binary PNG
+            resp = _get_raw(
+                f"/tabs/{session['tab_id']}/screenshot",
+                params={"userId": session["user_id"]},
+            )
+            image_bytes = resp.content
+
+        if image_bytes is None:
+            return tool_error("Screenshot capture failed", success=False)
 
         # Save screenshot to cache
         from hermes_constants import get_hermes_home
@@ -607,10 +736,10 @@ def camofox_vision(question: str, annotate: bool = False,
         screenshot_path = str(screenshots_dir / f"browser_screenshot_{uuid.uuid4().hex[:8]}.png")
 
         with open(screenshot_path, "wb") as f:
-            f.write(resp.content)
+            f.write(image_bytes)
 
         # Encode for vision LLM
-        img_b64 = base64.b64encode(resp.content).decode("utf-8")
+        img_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
         # Also get annotated snapshot if requested
         annotation_context = ""
@@ -674,6 +803,7 @@ def camofox_vision(question: str, annotate: bool = False,
             "success": True,
             "analysis": analysis,
             "screenshot_path": screenshot_path,
+            "screenshot_source": screenshot_source,
         })
     except Exception as e:
         return tool_error(str(e), success=False)
