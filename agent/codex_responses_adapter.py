@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import uuid
 from types import SimpleNamespace
@@ -244,6 +245,31 @@ def _normalize_responses_message_status(value: Any, *, default: str = "completed
     return default
 
 
+def _codex_replay_reasoning_enabled() -> bool:
+    """Whether to replay prior-turn reasoning items into the codex input.
+
+    Default **off**. Replaying a batch of prior ``codex_reasoning_items`` into
+    the input makes the chatgpt.com/backend-api/codex backend **hang with no
+    response on a cold prompt cache** — the SSE stream never emits a first
+    event and the call dies at the stale timeout (issue #21444 / #11179
+    family). Empirically isolated 2026-05-27 on a 198-message resume: full
+    reasoning replay -> 80s+ hang; dropping the reasoning items -> ~2s; and
+    keeping the items but stripping ``encrypted_content`` (summary-only) still
+    hangs — so it is the reasoning *items themselves* in the input, not just
+    the encrypted blob, that trips the cold backend. Upstream punted (PR
+    #31967 only fails faster; PR #32016 just adds a hint pointing at
+    ``gpt-5.4-codex``, which a ChatGPT account can't use). Dropping the replay
+    is the only fix that keeps gpt-5.5 working: the model re-reasons from the
+    visible history each turn; the reasoning summaries are still preserved in
+    the saved session, just not re-fed to the model.
+
+    Set ``HERMES_CODEX_REPLAY_REASONING=1`` to restore the old replay behavior.
+    """
+    return os.getenv("HERMES_CODEX_REPLAY_REASONING", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]],
     *,
@@ -255,9 +281,11 @@ def _chat_messages_to_responses_input(
     reasoning items.  xAI's OAuth/SuperGrok ``/v1/responses`` surface
     rejects encrypted reasoning blobs minted by prior turns: the request
     streams an ``error`` SSE frame before ``response.created`` and the
-    OpenAI SDK collapses it into a generic stream-ordering error.  Native
-    Codex (chatgpt.com backend-api) DOES accept replayed encrypted_content
-    — keep the default off.
+    OpenAI SDK collapses it into a generic stream-ordering error.
+
+    Replaying reasoning items into native Codex (chatgpt.com backend-api)
+    is gated behind :func:`_codex_replay_reasoning_enabled` (default off)
+    because it hangs the backend on a cold cache — see that function.
     """
     items: List[Dict[str, Any]] = []
     seen_item_ids: set = set()
@@ -294,7 +322,11 @@ def _chat_messages_to_responses_input(
                 # blob back in.
                 codex_reasoning = msg.get("codex_reasoning_items")
                 has_codex_reasoning = False
-                if isinstance(codex_reasoning, list) and not is_xai_responses:
+                if (
+                    isinstance(codex_reasoning, list)
+                    and not is_xai_responses
+                    and _codex_replay_reasoning_enabled()
+                ):
                     for ri in codex_reasoning:
                         if isinstance(ri, dict) and ri.get("encrypted_content"):
                             item_id = ri.get("id")
