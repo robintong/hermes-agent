@@ -781,21 +781,49 @@ class _CodexCompletionsAdapter:
                 timeout_timer.start()
             _check_cancelled()
             with self._client.responses.stream(**resp_kwargs) as stream:
-                for _event in stream:
-                    _check_cancelled()
-                    _etype = getattr(_event, "type", "")
-                    if _etype == "response.output_item.done":
-                        _done = getattr(_event, "item", None)
-                        if _done is not None:
-                            collected_output_items.append(_done)
-                    elif "output_text.delta" in _etype:
-                        _delta = getattr(_event, "delta", "")
-                        if _delta:
-                            collected_text_deltas.append(_delta)
-                    elif "function_call" in _etype:
-                        has_function_calls = True
+                _codex_null_output_crash = False
+                try:
+                    for _event in stream:
+                        _check_cancelled()
+                        _etype = getattr(_event, "type", "")
+                        if _etype == "response.output_item.done":
+                            _done = getattr(_event, "item", None)
+                            if _done is not None:
+                                collected_output_items.append(_done)
+                        elif "output_text.delta" in _etype:
+                            _delta = getattr(_event, "delta", "")
+                            if _delta:
+                                collected_text_deltas.append(_delta)
+                        elif "function_call" in _etype:
+                            has_function_calls = True
+                except TypeError as _codex_final_exc:
+                    # Issue #11179 / PR #32963 (other half of the main-loop fix):
+                    # the chatgpt.com/backend-api/codex backend can send a
+                    # terminal response.completed whose `output` is null. The
+                    # OpenAI SDK raises "'NoneType' object is not iterable" while
+                    # accumulating that event mid-iteration, before
+                    # get_final_response() and the backfill below can run. The
+                    # output items already arrived via response.output_item.done,
+                    # so recover from them rather than failing the auxiliary call
+                    # (this is what surfaced as "Auxiliary title generation
+                    # failed: 'NoneType' object is not iterable"). Guarded on the
+                    # exact SDK message so unrelated TypeErrors still propagate.
+                    if "iterable" not in str(_codex_final_exc):
+                        raise
+                    _codex_null_output_crash = True
+                    logger.warning(
+                        "Codex auxiliary: SDK crashed on null terminal output (%s); "
+                        "recovering from %d collected item(s) / %d text delta(s).",
+                        _codex_final_exc, len(collected_output_items),
+                        len(collected_text_deltas),
+                    )
                 _check_cancelled()
-                final = stream.get_final_response()
+                if _codex_null_output_crash:
+                    # Synthesize a minimal response; the empty-output backfill
+                    # below fills text from deltas when no items were collected.
+                    final = SimpleNamespace(output=list(collected_output_items), usage=None)
+                else:
+                    final = stream.get_final_response()
 
             # Backfill empty output from collected stream events
             _output = getattr(final, "output", None)
