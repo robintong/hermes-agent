@@ -7180,6 +7180,66 @@ class AIAgent:
                                 len(self._codex_streamed_text_parts), len(assembled),
                             )
                     return final_response
+            except TypeError as _final_exc:
+                # Issue #11179 / PR #32963 (merged upstream 2026-05-27): the
+                # chatgpt.com/backend-api/codex backend now emits a terminal
+                # response.completed whose `output` is null. The OpenAI SDK
+                # raises "'NoneType' object is not iterable" while accumulating
+                # that event inside the stream iterator (parse_response →
+                # `for output in response.output`), BEFORE get_final_response()
+                # and the empty-output backfill above can run. The real output
+                # items were already delivered via response.output_item.done and
+                # captured in collected_output_items, so recover from them rather
+                # than failing the whole turn. Guard on the exact SDK message so
+                # we never swallow an unrelated TypeError.
+                if "iterable" not in str(_final_exc):
+                    raise
+                if collected_output_items:
+                    logger.warning(
+                        "Codex stream: SDK crashed on null terminal output (%s); "
+                        "recovered %d output item(s) from stream events. %s",
+                        _final_exc, len(collected_output_items),
+                        self._client_log_context(),
+                    )
+                    return SimpleNamespace(
+                        output=list(collected_output_items),
+                        usage=None,
+                        status="completed",
+                        incomplete_details=None,
+                        model=api_kwargs.get("model"),
+                        error=None,
+                        output_text="".join(self._codex_streamed_text_parts) or None,
+                    )
+                if self._codex_streamed_text_parts and not has_tool_calls:
+                    assembled = "".join(self._codex_streamed_text_parts)
+                    logger.warning(
+                        "Codex stream: SDK crashed on null terminal output (%s); "
+                        "synthesized response from %d text delta(s). %s",
+                        _final_exc, len(self._codex_streamed_text_parts),
+                        self._client_log_context(),
+                    )
+                    return SimpleNamespace(
+                        output=[SimpleNamespace(
+                            type="message",
+                            role="assistant",
+                            status="completed",
+                            content=[SimpleNamespace(type="output_text", text=assembled)],
+                        )],
+                        usage=None,
+                        status="completed",
+                        incomplete_details=None,
+                        model=api_kwargs.get("model"),
+                        error=None,
+                        output_text=assembled,
+                    )
+                # Nothing recoverable from the stream — let the existing
+                # create(stream=True) fallback surface the real provider error.
+                logger.debug(
+                    "Codex stream: null-output crash with nothing to recover; "
+                    "falling back to create(stream=True). %s err=%s",
+                    self._client_log_context(), _final_exc,
+                )
+                return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
                     logger.debug(
